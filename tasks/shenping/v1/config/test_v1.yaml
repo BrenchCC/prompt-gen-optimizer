@@ -1,0 +1,71 @@
+# ============================================================
+# Prompt Optimizer — shenping 任务配置
+# ============================================================
+
+task:
+  name: shenping
+  version: v1
+  type: classify                     # classify | judge
+
+data:
+  file: tasks/shenping/v1/data/v1-92case.xlsx
+  format: xlsx                       # csv | xlsx
+  text_columns:                      # 构建 prompt 所需的列名（按顺序）
+    - 文章
+    - 评论
+  label_column: 人工打标是否神评       # 标签列名
+  label_map:                         # CSV 标签值 → 统一模型输出值
+    是: "是"
+    不是: "不是"
+    不确定: "不确定"
+  label_descriptions:                # 标签含义（用于 Master 错误分析展示）
+    是: 是神评
+    不是: 不是神评
+    不确定: 不确定是否神评
+  output_field: is_shenping           # LLM 输出 JSON 中的分类结果字段名
+  output_map:                         # 输出字段值 → 标准标签映射
+    "true": "是"
+    "false": "不是"
+    "null": "不确定"
+  feedback_column: 备注           # （可选）数据集中的人工备注/错误原因列
+  # custom_parser: tasks.shenping.v1.parser.parse_output  # 自定义解析函数（可选）
+
+prompt:
+  file: tasks/shenping/v1/prompt/002.md
+  variables:                         # prompt 模板中的占位符映射（key=占位符名, value=数据列名）
+    article_content: 文章
+    comment_content: 评论
+  user_prompt_template: |            # 构建发送给 Worker 的 user_prompt 模板
+    原文内容：{{article_content}}
+    评论内容：{{comment_content}}
+
+optimizer:
+  iterations: 10                      # 优化迭代轮数（不含 baseline）
+  patience: 3                         # 连续 N 轮 valid 无提升则 early stop
+  primary_metric: precision          # 主评估指标: accuracy | f1 | precision | recall
+  train_sample_size: 70              # 每轮 train 抽样数
+  val_sample_size: 30              # 每轮 valid 抽样数
+  concurrency: 8                     # LLM 并发请求数
+  vote_count: 1                      # 多数投票次数（1=不投票）
+  max_retries: 3                     # LLM 调用失败最大重试次数
+  max_error_samples: 8              # 提供给 Master 的最大错误样本数
+  seed: 42                           # 随机种子
+
+output:
+  dir: tasks/shenping/v1/output-002      # 输出目录
+  results_file: results.json         # 每轮指标记录
+  best_prompt_file: best_prompt.md   # 最优 prompt
+  best_score_file: best_score.json   # 最优分数记录
+  log_file: optimization_log.md      # 实验日志
+
+worker:
+  mode: ark                          # ark | openai
+  temperature: 0.1
+  top_p: 0.7
+  reasoning_option: disabled
+
+master:
+  mode: ark                          # ark | openai
+  temperature: 0.7
+  top_p: 0.95
+  reasoning_option: enabled

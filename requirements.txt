@@ -1,0 +1,11 @@
+pandas
+openpyxl
+matplotlib
+seaborn
+jupyter
+requests
+python-dotenv
+openai
+volcengine-python-sdk[ark]
+numpy==1.26.4
+tqdm
