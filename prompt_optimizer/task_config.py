@@ -43,6 +43,7 @@ class TaskConfig:
     vote_count: int = 1
     max_retries: int = 3
     max_error_samples: int = 10
+    prompt_candidate_count: int = 3
     suggestion_similarity_threshold: float = 0.82
     suggestion_concurrency: int = 4
     suggestion_pool_dir: str = ""
@@ -121,6 +122,7 @@ class TaskConfig:
         cfg.vote_count = opt_sec.get("vote_count", cfg.vote_count)
         cfg.max_retries = opt_sec.get("max_retries", cfg.max_retries)
         cfg.max_error_samples = opt_sec.get("max_error_samples", cfg.max_error_samples)
+        cfg.prompt_candidate_count = opt_sec.get("prompt_candidate_count", cfg.prompt_candidate_count)
         cfg.suggestion_similarity_threshold = opt_sec.get(
             "suggestion_similarity_threshold",
             cfg.suggestion_similarity_threshold,
@@ -187,6 +189,15 @@ class TaskConfig:
             return rel_path
         return os.path.normpath(os.path.join(project_root, rel_path))
 
+    @staticmethod
+    def _is_reasoning_enabled(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        normalized = str(value or "").strip().lower()
+        if not normalized:
+            return False
+        return normalized not in {"disabled", "off", "false", "none", "0"}
+
     def _validate(self) -> None:
         if self.task_type not in ("classify", "judge"):
             raise ValueError(f"不支持的任务类型: {self.task_type}")
@@ -220,6 +231,9 @@ class TaskConfig:
         if not 1 <= self.max_error_samples <= 20:
             raise ValueError("max_error_samples 必须在 1 到 20 之间")
 
+        if self.prompt_candidate_count < 1:
+            raise ValueError("prompt_candidate_count 必须大于等于 1")
+
         if not 0 < self.suggestion_similarity_threshold < 1:
             raise ValueError("suggestion_similarity_threshold 必须在 0 到 1 之间")
 
@@ -228,6 +242,9 @@ class TaskConfig:
 
         if not self.suggestion_pool_dir:
             raise ValueError("未指定 suggestion_pool_dir")
+
+        if not self._is_reasoning_enabled(self.master_reasoning_option):
+            raise ValueError("master.reasoning_option 必须开启思考")
 
     def ensure_output_dir(self) -> str:
         if self.output_dir:

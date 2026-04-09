@@ -38,6 +38,8 @@ def _jaccard(a: list[str], b: list[str]) -> float:
     return len(sa & sb) / max(1, len(sa | sb))
 
 class SuggestionPool:
+    REVIEW_GREY_ZONE = 0.12
+
     def __init__(
         self,
         task_config: TaskConfig,
@@ -186,7 +188,7 @@ class SuggestionPool:
             matched, similarity = self._find_best_match(prepared)
             decision = None
             if matched is not None and similarity >= threshold:
-                if self.review_fn is not None:
+                if self.review_fn is not None and similarity < 0.95:
                     decision = self.review_fn(matched, prepared)
                 else:
                     decision = "duplicate" if similarity >= max(threshold, 0.95) else "merge"
@@ -242,12 +244,31 @@ class SuggestionPool:
     def _find_best_match(self, prepared: dict[str, Any]) -> tuple[dict[str, Any] | None, float]:
         best: dict[str, Any] | None = None
         best_sim = 0.0
-        for record in self.pool.get("active_suggestions", []):
+        candidates = self._candidate_records(prepared)
+        for record in candidates:
             sim = self._similarity(record, prepared)
             if sim > best_sim:
                 best_sim = sim
                 best = record
         return best, best_sim
+
+    def _candidate_records(self, prepared: dict[str, Any]) -> list[dict[str, Any]]:
+        active = self.pool.get("active_suggestions", [])
+        if not active:
+            return []
+
+        category = str(prepared.get("category", "")).strip()
+        keyword_matches: list[str] = []
+        for keyword in unique_keywords(prepared.get("keywords")):
+            keyword_matches.extend(self.index.get("by_keyword", {}).get(keyword, []))
+        category_matches = self.index.get("by_category", {}).get(category, []) if category else []
+        candidate_ids = list(dict.fromkeys(category_matches + keyword_matches))
+        if not candidate_ids:
+            return active
+
+        candidate_set = set(candidate_ids)
+        narrowed = [record for record in active if record.get("id") in candidate_set]
+        return narrowed or active
 
     def _merge_records(
         self,

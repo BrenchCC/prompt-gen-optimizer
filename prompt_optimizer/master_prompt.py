@@ -138,6 +138,7 @@ def build_master_user_prompt(
     task_description: str = "",
     round_suggestions: str = "本轮暂无新增建议。",
     experience_feedback: str = "本轮暂无结构化错误经验反馈，请结合历史趋势与新增建议自行归纳。",
+    candidate_count: int = 3,
 ) -> str:
     primary = task_config.primary_metric
     max_samples = task_config.max_error_samples
@@ -163,6 +164,7 @@ def build_master_user_prompt(
         shown_errors=min(total_errors, max_samples),
         round_suggestions=round_suggestions,
         experience_feedback=experience_feedback,
+        candidate_count=max(1, candidate_count),
     )
 
 
@@ -176,6 +178,7 @@ def build_master_prompt(
     task_description: str = "",
     round_suggestions: str = "本轮暂无新增建议。",
     experience_feedback: str = "本轮暂无结构化错误经验反馈，请结合历史趋势与新增建议自行归纳。",
+    candidate_count: int = 3,
 ) -> str:
     return build_master_user_prompt(
         current_prompt=current_prompt,
@@ -187,4 +190,5 @@ def build_master_prompt(
         task_description=task_description,
         round_suggestions=round_suggestions,
         experience_feedback=experience_feedback,
+        candidate_count=candidate_count,
     )

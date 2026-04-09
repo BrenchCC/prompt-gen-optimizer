@@ -102,13 +102,15 @@ class TestBuildMasterPrompt:
             task_config=task_config,
             round_suggestions="- [规则缺失] 补充边界条件",
             experience_feedback="### 整体总结\n边界规则不足",
+            candidate_count=3,
         )
         assert "test prompt" in prompt
         assert "本轮错误经验与建议" in prompt
         assert "错误经验反馈" in prompt
         assert "建议摘要" in prompt
-        assert "错误经验反馈" in prompt
-        assert "Step 1：错误模式聚类" in prompt
+        assert "输出 3 个候选 Prompt" in prompt
+        assert "candidates` 长度必须等于 3" in prompt
+        assert "patch_focus" in prompt
         assert "独立分析 5 条并提炼为优化建议" in prompt
 
     def test_includes_history(self, task_config: TaskConfig) -> None:
@@ -147,7 +149,8 @@ class TestBuildMasterPrompt:
         )
         assert "长期系统级优化建议" in prompt
         assert "补充边界定义" in prompt
-        assert "输出格式" in prompt
+        assert '"candidates"' in prompt
+        assert "candidate_prompt" in prompt
 
     def test_build_suggestion_prompt_requires_json(self, task_config: TaskConfig) -> None:
         errors = [
@@ -174,7 +177,7 @@ class TestBuildMasterPrompt:
         assert "effective_strategies" in prompt
         assert "ineffective_or_risky_strategies" in prompt
         assert "suggestions" in prompt
-        assert "长度必须为 1" in prompt
+        assert "长度必须为 2-4 条" in prompt
         assert '"title"' not in prompt
         assert "<current_prompt>" in prompt
         assert "你是一个神评判断器" in prompt

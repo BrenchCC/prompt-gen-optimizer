@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import hashlib
+import json
+from threading import Lock
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any
@@ -22,6 +25,10 @@ class Evaluator:
         self.custom_parser_fn = task_config.load_custom_parser()
         self.worker_options = resolve_model_config(role="worker", task_config=task_config)
         self.worker_client = self._init_worker_client()
+        self._inference_cache: dict[str, tuple[str, str]] = {}
+        self._cache_lock = Lock()
+        self._cache_hits = 0
+        self._cache_misses = 0
 
     @property
     def concurrency(self) -> int:
@@ -46,6 +53,14 @@ class Evaluator:
     @property
     def output_map(self) -> dict[str, str]:
         return self.task_config.output_map
+
+    def get_cache_stats(self) -> dict[str, int]:
+        with self._cache_lock:
+            return {
+                "hits": self._cache_hits,
+                "misses": self._cache_misses,
+                "size": len(self._inference_cache),
+            }
 
     def _init_worker_client(self):
         return build_llm_client(
@@ -151,6 +166,31 @@ class Evaluator:
         )
         return result
 
+    def _build_cache_key(
+        self,
+        item: dict[str, Any],
+        prompt: str,
+        query: str,
+        system_prompt: str | None,
+    ) -> str:
+        sample_signature = {
+            "fields": item.get("fields", {}),
+            "label": item.get("label", ""),
+        }
+        payload = {
+            "prompt": prompt,
+            "query": query,
+            "system_prompt": system_prompt or "",
+            "sample": sample_signature,
+            "model": self.worker_options.get("model_name", ""),
+            "mode": self.worker_options.get("mode", ""),
+            "reasoning_option": self.worker_options.get("reasoning_option", ""),
+            "temperature": self.worker_options.get("temperature", ""),
+            "top_p": self.worker_options.get("top_p", ""),
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha1(encoded.encode("utf-8")).hexdigest()
+
     def _evaluate_single(
         self,
         idx: int,
@@ -159,10 +199,22 @@ class Evaluator:
         system_prompt: str | None = None,
     ) -> tuple[int, str, str, str, str, str]:
         query = self._build_query(prompt, item)
+        cache_key = self._build_cache_key(item, prompt, query, system_prompt)
 
         if self.vote_count <= 1:
-            out = self._call_worker(query, system_prompt=system_prompt, temperature=0.0)
-            pred = self._parse_prediction(out)
+            with self._cache_lock:
+                cached = self._inference_cache.get(cache_key)
+                if cached is not None:
+                    self._cache_hits += 1
+                else:
+                    self._cache_misses += 1
+            if cached is not None:
+                pred, out = cached
+            else:
+                out = self._call_worker(query, system_prompt=system_prompt, temperature=0.0)
+                pred = self._parse_prediction(out)
+                with self._cache_lock:
+                    self._inference_cache[cache_key] = (pred, out)
         else:
             votes: list[str] = []
             for _ in range(self.vote_count):

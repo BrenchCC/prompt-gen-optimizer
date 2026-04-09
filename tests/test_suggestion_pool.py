@@ -153,3 +153,28 @@ def test_apply_feedback_and_snapshot(tmp_path) -> None:
     assert updated == ["SUG-0001"]
     assert active[0]["positive_hits"] == 1
     assert os.path.exists(cfg.suggestion_snapshots_path)
+
+
+def test_review_fn_can_keep_grey_zone_suggestions_independent(tmp_path) -> None:
+    cfg = build_config(tmp_path)
+    cfg.suggestion_similarity_threshold = 0.6
+    pool = SuggestionPool(cfg, review_fn=lambda current, candidate: "independent")
+    pool.ingest([{
+        "title": "补充边界规则",
+        "category": "规则缺失",
+        "root_cause": "缺少边界说明",
+        "suggestion": "补充正反边界与冲突消解规则",
+        "keywords": ["边界", "冲突"],
+        "source_samples": ["sample-1"],
+    }], step=1)
+    result = pool.ingest([{
+        "title": "补充边界规则说明",
+        "category": "规则缺失",
+        "root_cause": "边界不清晰",
+        "suggestion": "补充正反边界与冲突消解规则，并明确适用边界",
+        "keywords": ["边界", "冲突"],
+        "source_samples": ["sample-2"],
+    }], step=2)
+
+    assert result["added_ids"] == ["SUG-0002"]
+    assert len(pool.active_suggestions()) == 2

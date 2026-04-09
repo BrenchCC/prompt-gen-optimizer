@@ -16,7 +16,7 @@ def main() -> None:
     parser.add_argument("--iterations", type=int, default=None, help="覆盖优化迭代轮数")
     parser.add_argument("--patience", type=int, default=None, help="覆盖 early stop 耐心值")
     parser.add_argument("--metric", type=str, default=None,
-                        choices=["accuracy", "f1", "precision", "recall"], help="覆盖主评估指标")
+                        choices=["accuracy", "f1", "precision", "precision_pos", "recall"], help="覆盖主评估指标")
     parser.add_argument("--concurrency", type=int, default=None, help="覆盖 LLM 并发数")
     parser.add_argument("--seed", type=int, default=None, help="覆盖随机种子")
     parser.add_argument("--log-level", type=str, default="INFO",

@@ -19,7 +19,6 @@ from prompt_optimizer.master_prompt import (
     build_master_system_prompt,
     build_suggestion_prompt,
     format_error,
-    sample_errors,
 )
 from prompt_optimizer.prompt_templates import render_prompt_template
 from prompt_optimizer.response_utils import parse_json_dict, parse_string_dict, strip_code_fence
@@ -37,7 +36,10 @@ class PromptOptimizer:
         self.master_options = resolve_model_config(role="master", task_config=task_config)
         self.master_client = self._init_master_client()
         self.history: list[dict[str, Any]] = []
-        self.suggestion_pool = SuggestionPool(task_config)
+        self.suggestion_pool = SuggestionPool(task_config, review_fn=self._review_suggestion_pair)
+        self.task_description = ""
+        self.train_sample: list[dict[str, Any]] = []
+        self.val_sample: list[dict[str, Any]] = []
 
     def _init_master_client(self):
         return build_llm_client(
@@ -124,6 +126,11 @@ class PromptOptimizer:
         logger.info(f"抽样完成: train={len(train_set)}, valid={len(val_set)}, 总数据={len(data)}")
         return train_set, val_set
 
+    def _ensure_eval_samples(self, data: list[dict]) -> tuple[list[dict], list[dict]]:
+        if not self.train_sample and not self.val_sample:
+            self.train_sample, self.val_sample = self._sample_train_val(data)
+        return self.train_sample, self.val_sample
+
     def _init_worker_prompt_log(self) -> None:
         log_path = self.cfg.output_worker_prompt_log_path
         self.cfg.ensure_output_dir()
@@ -148,30 +155,73 @@ class PromptOptimizer:
             f.write(f"```markdown\n{prompt_text}\n```\n\n")
             f.write("---\n\n")
 
-    def _eval_prompt(
-        self, prompt: str, system_prompt: str, data: list[dict], step_label: str
-    ) -> tuple[dict, dict, list, list]:
+    def _evaluate_split(
+        self,
+        prompt: str,
+        system_prompt: str,
+        dataset: list[dict[str, Any]],
+        step_label: str,
+        mode: str,
+    ) -> tuple[dict[str, float], list[dict[str, Any]]]:
         self._append_worker_prompt_log(
-            stage=step_label,
+            stage=f"{step_label}-{mode}",
             system_prompt=system_prompt,
             extra={
-                "mode": "train+valid",
+                "mode": mode,
                 "prompt_lines": len(system_prompt.splitlines()) if system_prompt else 0,
             },
         )
-        train_sample, val_sample = self._sample_train_val(data)
-
-        t_preds, t_raws, t_queries = self.evaluator.run_prompt(
-            prompt, train_sample, desc=f"{step_label} Train", system_prompt=system_prompt
+        preds, raws, queries = self.evaluator.run_prompt(
+            prompt,
+            dataset,
+            desc=f"{step_label} {mode.title()}",
+            system_prompt=system_prompt,
         )
-        m_train, t_errors = self.evaluator.evaluate(t_preds, train_sample, t_raws, t_queries)
+        metrics, errors = self.evaluator.evaluate(preds, dataset, raws, queries)
+        return metrics, errors
 
-        v_preds, v_raws, v_queries = self.evaluator.run_prompt(
-            prompt, val_sample, desc=f"{step_label} Valid", system_prompt=system_prompt
+    def _eval_prompt(
+        self,
+        prompt: str,
+        system_prompt: str,
+        step_label: str,
+        run_train: bool = True,
+    ) -> tuple[dict[str, float], dict[str, float], list[dict[str, Any]], list[dict[str, Any]]]:
+        train_sample, val_sample = self.train_sample, self.val_sample
+        metrics_train: dict[str, float] = {}
+        train_errors: list[dict[str, Any]] = []
+        if run_train and train_sample:
+            metrics_train, train_errors = self._evaluate_split(
+                prompt,
+                system_prompt,
+                train_sample,
+                step_label,
+                "train",
+            )
+        metrics_val, val_errors = self._evaluate_split(
+            prompt,
+            system_prompt,
+            val_sample,
+            step_label,
+            "valid",
         )
-        m_val, v_errors = self.evaluator.evaluate(v_preds, val_sample, v_raws, v_queries)
+        return metrics_train, metrics_val, train_errors, val_errors
 
-        return m_train, m_val, t_errors, v_errors
+    def _evaluate_train_only(
+        self,
+        prompt: str,
+        system_prompt: str,
+        step_label: str,
+    ) -> tuple[dict[str, float], list[dict[str, Any]]]:
+        if not self.train_sample:
+            return {}, []
+        return self._evaluate_split(
+            prompt,
+            system_prompt,
+            self.train_sample,
+            step_label,
+            "train",
+        )
 
     def _clean_prompt(self, raw: str) -> str:
         return strip_code_fence(raw)
@@ -289,6 +339,7 @@ class PromptOptimizer:
             task_description=self.task_description,
             round_suggestions=build_round_suggestions_text(round_suggestions),
             experience_feedback=build_experience_feedback_text(experience_feedback),
+            candidate_count=self.cfg.prompt_candidate_count,
         )
         return system_prompt, user_prompt
 
@@ -311,6 +362,53 @@ class PromptOptimizer:
             "optimization_priorities": payload.get("optimization_priorities", []),
         }
         return feedback, suggestions
+
+    def _parse_candidate_response(
+        self,
+        raw: str,
+        current_prompt: str,
+    ) -> list[dict[str, Any]]:
+        payload = self._parse_json_object(raw)
+        parsed_candidates = payload.get("candidates", []) if payload else []
+        candidates: list[dict[str, Any]] = []
+        if isinstance(parsed_candidates, list):
+            for idx, item in enumerate(parsed_candidates, 1):
+                if not isinstance(item, dict):
+                    continue
+                candidate_prompt = self._clean_prompt(str(item.get("candidate_prompt", "")).strip())
+                if not candidate_prompt:
+                    continue
+                candidates.append({
+                    "strategy_name": str(item.get("strategy_name", "")).strip() or f"候选策略 {idx}",
+                    "patch_focus": str(item.get("patch_focus", "")).strip() or "未提供补丁焦点",
+                    "candidate_prompt": candidate_prompt,
+                })
+
+        if not candidates:
+            fallback_prompt = self._clean_prompt(raw)
+            if fallback_prompt:
+                candidates.append({
+                    "strategy_name": "回退候选",
+                    "patch_focus": "Master 未返回结构化候选，回退到单一 Prompt 输出",
+                    "candidate_prompt": fallback_prompt,
+                })
+
+        deduped: list[dict[str, Any]] = []
+        seen_prompts: set[str] = set()
+        for item in candidates:
+            prompt_text = item["candidate_prompt"].strip()
+            if not prompt_text or prompt_text in seen_prompts:
+                continue
+            seen_prompts.add(prompt_text)
+            deduped.append(item)
+
+        if not deduped:
+            deduped.append({
+                "strategy_name": "保持现状",
+                "patch_focus": "候选解析失败，维持当前 Prompt",
+                "candidate_prompt": current_prompt,
+            })
+        return deduped[: max(1, self.cfg.prompt_candidate_count)]
 
     def _generate_batch_suggestions(
         self,
@@ -354,50 +452,7 @@ class PromptOptimizer:
                     "raw_output": raw,
                 },
             })
-        if len(suggestions) > 1:
-            merged_keywords: list[str] = []
-            merged_root_causes: list[str] = []
-            merged_suggestions: list[str] = []
-            merged_risks: list[str] = []
-            confidences: list[float] = []
-            categories: list[str] = []
-            for s in suggestions:
-                category = str(s.get("category", "")).strip()
-                if category and category not in categories:
-                    categories.append(category)
-                for kw in s.get("keywords", []) or []:
-                    kw_s = str(kw).strip()
-                    if kw_s and kw_s not in merged_keywords:
-                        merged_keywords.append(kw_s)
-                rc = str(s.get("root_cause", "")).strip()
-                if rc and rc not in merged_root_causes:
-                    merged_root_causes.append(rc)
-                sug = str(s.get("suggestion", "")).strip()
-                if sug and sug not in merged_suggestions:
-                    merged_suggestions.append(sug)
-                risk = str(s.get("risk", "")).strip()
-                if risk and risk not in merged_risks:
-                    merged_risks.append(risk)
-                try:
-                    confidences.append(float(s.get("confidence", 0.5)))
-                except (TypeError, ValueError):
-                    pass
-            merged = {
-                "title": "本轮总结建议",
-                "category": " / ".join(categories) if categories else "未分类",
-                "root_cause": "；".join(merged_root_causes),
-                "suggestion": "\n".join(f"{i}. {text}" for i, text in enumerate(merged_suggestions, 1)),
-                "keywords": merged_keywords[:5],
-                "risk": "；".join(merged_risks),
-                "confidence": sum(confidences) / len(confidences) if confidences else 0.5,
-                "source_samples": formatted_errors,
-                "source_payload": {
-                    "query": query,
-                    "reasoning_content": reasoning_content,
-                    "raw_output": raw,
-                },
-            }
-            suggestions = [merged]
+        suggestions = suggestions[:4]
         if not suggestions:
             fallback_text = "\n\n---\n\n".join(formatted_errors) if formatted_errors else "无错误样本。"
             suggestions.append({
@@ -431,6 +486,27 @@ class PromptOptimizer:
         }
         return suggestions, experience_feedback, trace
 
+    def _generate_prompt_candidates(
+        self,
+        current_prompt: str,
+        metrics_train: dict[str, float],
+        metrics_val: dict[str, float],
+        total_errors: int,
+        suggestions: list[dict[str, Any]],
+        experience_feedback: dict[str, Any] | None,
+    ) -> tuple[list[dict[str, Any]], str, str, str, str]:
+        master_system_prompt, master_query = self._build_master_messages(
+            current_prompt=current_prompt,
+            metrics_train=metrics_train,
+            metrics_val=metrics_val,
+            total_errors=total_errors,
+            round_suggestions=suggestions,
+            experience_feedback=experience_feedback,
+        )
+        reasoning_content, raw = self._call_master(master_query, system_prompt=master_system_prompt)
+        candidates = self._parse_candidate_response(raw, current_prompt=current_prompt)
+        return candidates, master_system_prompt, master_query, reasoning_content, raw
+
     def _merge_and_store_suggestions(
         self,
         step: int,
@@ -461,6 +537,7 @@ class PromptOptimizer:
         master_user_prompt: str,
         reasoning_content: str,
         raw_output: str,
+        prompt_candidates: list[dict[str, Any]],
     ) -> None:
         log_path = self.cfg.output_master_log_path
         self.cfg.ensure_output_dir()
@@ -474,6 +551,14 @@ class PromptOptimizer:
                 "confidence": suggestion.get("confidence", 0.0),
             }
             for suggestion in suggestions
+        ]
+        candidate_summary = [
+            {
+                "strategy_name": item.get("strategy_name", ""),
+                "patch_focus": item.get("patch_focus", ""),
+                "prompt_lines": len(str(item.get("candidate_prompt", "")).splitlines()),
+            }
+            for item in prompt_candidates
         ]
         with open(log_path, "a", encoding="utf-8") as f:
             f.write(f"# Step {step}\n\n")
@@ -499,11 +584,8 @@ class PromptOptimizer:
             f.write(f"```json\n{json.dumps(pool_result.get('decisions', []), ensure_ascii=False, indent=2)}\n```\n\n")
             f.write("## Merged Suggestions\n")
             f.write(f"```text\n{pool_result.get('system_prompt_text', '')}\n```\n\n")
-            f.write("## Master Full Prompt\n")
-            f.write("### system_prompt\n\n")
-            f.write(f"```text\n{master_system_prompt}\n```\n\n")
-            f.write("### user_prompt\n\n")
-            f.write(f"```text\n{master_user_prompt}\n```\n\n")
+            f.write("## Candidate Summary\n")
+            f.write(f"```json\n{json.dumps(candidate_summary, ensure_ascii=False, indent=2)}\n```\n\n")
             f.write("## Master System Prompt\n")
             f.write(f"```text\n{master_system_prompt}\n```\n\n")
             f.write("## Master Input Query\n")
@@ -512,6 +594,10 @@ class PromptOptimizer:
             f.write(f"```text\n{reasoning_content}\n```\n\n")
             f.write("## Master Raw Output\n")
             f.write(f"```text\n{raw_output}\n```\n\n")
+            for idx, item in enumerate(prompt_candidates, 1):
+                f.write(f"## Candidate {idx}: {item.get('strategy_name', '')}\n")
+                f.write(f"**patch_focus:** {item.get('patch_focus', '')}\n\n")
+                f.write(f"```markdown\n{item.get('candidate_prompt', '')}\n```\n\n")
             f.write("---\n\n")
 
     def _improve_prompt(
@@ -522,7 +608,7 @@ class PromptOptimizer:
         metrics_val: dict,
         val_errors: list,
         train_errors: list,
-    ) -> tuple[str, list[str], dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], list[str], dict[str, Any]]:
         sampled_errors, total_errors = self._collect_sampled_errors(
             val_errors,
             train_errors,
@@ -530,17 +616,14 @@ class PromptOptimizer:
         suggestions, experience_feedback, suggestion_trace = self._generate_batch_suggestions(sampled_errors, current_prompt)
         pool_result = self._merge_and_store_suggestions(step, suggestions)
         pool_result["experience_feedback"] = experience_feedback
-        master_system_prompt, master_query = self._build_master_messages(
+        prompt_candidates, master_system_prompt, master_query, reasoning_content, raw = self._generate_prompt_candidates(
             current_prompt=current_prompt,
             metrics_train=metrics_train,
             metrics_val=metrics_val,
             total_errors=total_errors,
-            round_suggestions=suggestions,
             experience_feedback=experience_feedback,
+            suggestions=suggestions,
         )
-
-        reasoning_content, raw = self._call_master(master_query, system_prompt=master_system_prompt)
-        new_prompt = self._clean_prompt(raw)
         self._log_master_step(
             step=step,
             suggestions=suggestions,
@@ -550,13 +633,9 @@ class PromptOptimizer:
             master_user_prompt=master_query,
             reasoning_content=reasoning_content,
             raw_output=raw,
+            prompt_candidates=prompt_candidates,
         )
-
-        if not new_prompt:
-            logger.warning("Master 返回空 prompt，保持原 prompt 不变")
-            return current_prompt, pool_result.get("selected_ids", []), pool_result
-
-        return new_prompt, pool_result.get("selected_ids", []), pool_result
+        return prompt_candidates, pool_result.get("selected_ids", []), pool_result
 
     def _append_results(self, path: str, record: dict) -> None:
         records = []
@@ -739,6 +818,35 @@ class PromptOptimizer:
         )
         return result
 
+    @staticmethod
+    def _cache_delta(before: dict[str, int], after: dict[str, int]) -> dict[str, int]:
+        keys = set(before) | set(after)
+        return {key: int(after.get(key, 0)) - int(before.get(key, 0)) for key in keys}
+
+    def _select_best_candidate(self, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+        primary = self.cfg.primary_metric
+        return max(
+            candidates,
+            key=lambda item: (
+                item.get("metrics_val", {}).get(primary, 0.0),
+                -len(item.get("val_errors", [])),
+                -int(item.get("prompt_lines", 0)),
+            ),
+        )
+
+    def _build_candidate_score_summary(self, candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        primary = self.cfg.primary_metric
+        summary: list[dict[str, Any]] = []
+        for item in candidates:
+            summary.append({
+                "strategy_name": item.get("strategy_name", ""),
+                "patch_focus": item.get("patch_focus", ""),
+                "valid_primary": round(item.get("metrics_val", {}).get(primary, 0.0), 4),
+                "valid_error_count": len(item.get("val_errors", [])),
+                "prompt_lines": int(item.get("prompt_lines", 0)),
+            })
+        return summary
+
     def optimize(self) -> dict[str, Any]:
         random.seed(self.cfg.seed)
         data = self.cfg.load_data()
@@ -767,8 +875,8 @@ class PromptOptimizer:
             return {"status": "error", "message": "empty prompt"}
 
         original_prompt = current_prompt
-        system_prompt = current_prompt
         best_prompt = current_prompt
+        self._ensure_eval_samples(data)
 
         self.task_description = self._get_or_generate_task_description(original_prompt)
         best_val_score = 0.0
@@ -780,11 +888,19 @@ class PromptOptimizer:
             f"patience={self.cfg.patience}, metric={primary}, "
             f"train_sample={self.cfg.train_sample_size}, val_sample={self.cfg.val_sample_size}"
         )
+        logger.info(
+            f"固定评测集: train={len(self.train_sample)}, valid={len(self.val_sample)}, "
+            f"candidate_count={self.cfg.prompt_candidate_count}"
+        )
 
         logger.info("=== Step 0: 评测初始 Prompt (Baseline) ===")
+        baseline_cache_before = self.evaluator.get_cache_stats()
         metrics_train, metrics_val, train_errors, val_errors = self._eval_prompt(
-            current_prompt, system_prompt, data, "Step0"
+            current_prompt,
+            current_prompt,
+            "Step0",
         )
+        baseline_cache_delta = self._cache_delta(baseline_cache_before, self.evaluator.get_cache_stats())
 
         val_primary = metrics_val.get(primary, 0)
         train_primary = metrics_train.get(primary, 0)
@@ -796,11 +912,19 @@ class PromptOptimizer:
         best_val_score = val_primary
         best_prompt = current_prompt
         best_metrics = metrics_val.copy()
+        best_train_metrics = metrics_train.copy()
+        best_train_errors = list(train_errors)
+        best_val_errors = list(val_errors)
 
         self._append_results(results_path, {
             "step": 0, "status": "baseline",
             "train_metrics": metrics_train, "val_metrics": metrics_val,
             "prompt_lines": len(current_prompt.splitlines()),
+            "candidate_count": 1,
+            "candidate_scores": [],
+            "selected_candidate": "baseline",
+            "eval_mode": "fixed-valid-two-stage",
+            "cache_stats": baseline_cache_delta,
             "timestamp": datetime.now().isoformat(),
         })
 
@@ -836,31 +960,69 @@ class PromptOptimizer:
             })
 
             logger.info("Generating new prompt (Master)...")
-            new_prompt, selected_suggestion_ids, pool_result = self._improve_prompt(
+            prompt_candidates, selected_suggestion_ids, pool_result = self._improve_prompt(
                 step, current_prompt, metrics_train, metrics_val, val_errors, train_errors
             )
+            logger.info(f"--- Iteration {step}/{self.cfg.iterations}: 候选评测 ---")
+            step_cache_before = self.evaluator.get_cache_stats()
+            candidate_records: list[dict[str, Any]] = []
+            for idx, item in enumerate(prompt_candidates, 1):
+                candidate_prompt = str(item.get("candidate_prompt", "")).strip() or current_prompt
+                _, candidate_val_metrics, _, candidate_val_errors = self._eval_prompt(
+                    candidate_prompt,
+                    candidate_prompt,
+                    f"Step{step}-Cand{idx}",
+                    run_train=False,
+                )
+                candidate_records.append({
+                    **item,
+                    "candidate_prompt": candidate_prompt,
+                    "metrics_val": candidate_val_metrics,
+                    "val_errors": candidate_val_errors,
+                    "prompt_lines": len(candidate_prompt.splitlines()),
+                })
 
-            system_prompt = new_prompt
-            current_prompt = new_prompt
-            logger.info(f"New prompt written ({len(new_prompt.splitlines())} lines)")
-
-            logger.info(f"--- Iteration {step}/{self.cfg.iterations}: 评测新 prompt ---")
-            metrics_train, metrics_val, train_errors, val_errors = self._eval_prompt(
-                current_prompt, system_prompt, data, f"Step{step}"
+            winning_candidate = self._select_best_candidate(candidate_records)
+            winning_train_metrics, winning_train_errors = self._evaluate_train_only(
+                winning_candidate["candidate_prompt"],
+                winning_candidate["candidate_prompt"],
+                f"Step{step}-Winner",
             )
+            winning_candidate["metrics_train"] = winning_train_metrics
+            winning_candidate["train_errors"] = winning_train_errors
+            candidate_scores = self._build_candidate_score_summary(candidate_records)
+            logger.info(f"候选评分: {candidate_scores}")
 
-            val_primary = metrics_val.get(primary, 0)
-            train_primary = metrics_train.get(primary, 0)
+            candidate_metrics_val = winning_candidate["metrics_val"]
+            candidate_metrics_train = winning_train_metrics
+            candidate_val_errors = winning_candidate["val_errors"]
+            candidate_train_errors = winning_train_errors
+            val_primary = candidate_metrics_val.get(primary, 0)
+            train_primary = candidate_metrics_train.get(primary, 0)
             metrics_str = " | ".join(
-                [f"{k}: Train={metrics_train[k]:.4f}/Valid={metrics_val[k]:.4f}" for k in metrics_val]
+                [
+                    f"{k}: Train={candidate_metrics_train.get(k, 0):.4f}/Valid={candidate_metrics_val.get(k, 0):.4f}"
+                    for k in candidate_metrics_val
+                ]
             )
-            logger.info(f"{metrics_str} | Prompt Lines: {len(current_prompt.splitlines())}")
+            logger.info(
+                f"{metrics_str} | Prompt Lines: {len(winning_candidate['candidate_prompt'].splitlines())}"
+            )
             metric_delta = val_primary - best_val_score
+            cache_stats_delta = self._cache_delta(step_cache_before, self.evaluator.get_cache_stats())
 
             if val_primary > best_val_score:
+                current_prompt = winning_candidate["candidate_prompt"]
+                metrics_train = candidate_metrics_train
+                metrics_val = candidate_metrics_val
+                train_errors = candidate_train_errors
+                val_errors = candidate_val_errors
                 best_val_score = val_primary
                 best_prompt = current_prompt
                 best_metrics = metrics_val.copy()
+                best_train_metrics = metrics_train.copy()
+                best_train_errors = list(train_errors)
+                best_val_errors = list(val_errors)
                 no_improve_count = 0
                 status = "keep"
                 logger.info(f"Valid {primary} improved! Best: {best_val_score:.4f}")
@@ -872,7 +1034,10 @@ class PromptOptimizer:
                     f"Best: {best_val_score:.4f}"
                 )
                 current_prompt = best_prompt
-                system_prompt = best_prompt
+                metrics_train = best_train_metrics.copy()
+                metrics_val = best_metrics.copy()
+                train_errors = list(best_train_errors)
+                val_errors = list(best_val_errors)
                 logger.info("Rolled back to best prompt.")
 
             feedback_updated_ids = self.suggestion_pool.apply_feedback(
@@ -889,6 +1054,11 @@ class PromptOptimizer:
                 "step": step, "status": status,
                 "train_metrics": metrics_train, "val_metrics": metrics_val,
                 "prompt_lines": len(current_prompt.splitlines()),
+                "candidate_count": len(candidate_records),
+                "candidate_scores": candidate_scores,
+                "selected_candidate": winning_candidate.get("strategy_name", ""),
+                "eval_mode": "fixed-valid-two-stage",
+                "cache_stats": cache_stats_delta,
                 "selected_suggestion_ids": selected_suggestion_ids,
                 "suggestion_added_ids": pool_result.get("added_ids", []),
                 "suggestion_updated_ids": pool_result.get("updated_ids", []),
@@ -907,6 +1077,9 @@ class PromptOptimizer:
                     f"suggestions added: {pool_result.get('added_ids', [])}\n"
                     f"suggestions updated: {pool_result.get('updated_ids', [])}\n"
                     f"feedback updated: {feedback_updated_ids}\n"
+                    f"candidate scores: {json.dumps(candidate_scores, ensure_ascii=False)}\n"
+                    f"selected candidate: {winning_candidate.get('strategy_name', '')}\n"
+                    f"cache stats delta: {cache_stats_delta}\n"
                     f"metric delta vs best-before-step: {metric_delta:+.4f}"
                 ),
             )
@@ -921,6 +1094,10 @@ class PromptOptimizer:
                     "step": step, "status": "early_stop",
                     "train_metrics": metrics_train, "val_metrics": metrics_val,
                     "prompt_lines": len(best_prompt.splitlines()),
+                    "candidate_scores": candidate_scores,
+                    "selected_candidate": winning_candidate.get("strategy_name", ""),
+                    "eval_mode": "fixed-valid-two-stage",
+                    "cache_stats": cache_stats_delta,
                     "timestamp": datetime.now().isoformat(),
                     "description": "rolled back to best",
                 })

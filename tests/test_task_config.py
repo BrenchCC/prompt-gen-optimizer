@@ -46,6 +46,7 @@ def test_from_yaml_loads_optimizer_section(shenping_config: TaskConfig) -> None:
     assert isinstance(shenping_config.iterations, int) and shenping_config.iterations > 0
     assert isinstance(shenping_config.patience, int) and shenping_config.patience > 0
     assert shenping_config.primary_metric in ("accuracy", "f1", "precision", "precision_pos", "recall")
+    assert shenping_config.prompt_candidate_count == 3
     assert shenping_config.concurrency == 8
     assert shenping_config.suggestion_concurrency == 4
     assert shenping_config.suggestion_similarity_threshold == 0.82
@@ -245,6 +246,30 @@ def test_validate_bad_max_error_samples() -> None:
 
     try:
         with pytest.raises(ValueError, match="max_error_samples"):
+            TaskConfig.from_yaml(tmp_path, project_root=ROOT)
+    finally:
+        os.unlink(tmp_path)
+
+
+def test_validate_master_reasoning_must_be_enabled() -> None:
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
+        yaml.dump({
+            "task": {"type": "classify"},
+            "data": {
+                "file": "fake.csv", "text_columns": ["text"],
+                "label_column": "label", "label_map": {"a": "a"},
+            },
+            "optimizer": {
+                "suggestion_pool_dir": "suggestions",
+            },
+            "master": {
+                "reasoning_option": "disabled",
+            },
+        }, f)
+        tmp_path = f.name
+
+    try:
+        with pytest.raises(ValueError, match="开启思考"):
             TaskConfig.from_yaml(tmp_path, project_root=ROOT)
     finally:
         os.unlink(tmp_path)
