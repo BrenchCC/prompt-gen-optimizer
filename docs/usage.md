@@ -2,12 +2,22 @@
 
 ## 系统概览
 
-Prompt Optimizer 是一个基于 Agent 的 Prompt 自动优化框架，通过 Worker 模型执行任务评测、Master 模型分析错误并增量改写 Prompt，实现自动化的 Prompt 迭代优化。
+Prompt Optimizer 是一个基于 Agent 的 Prompt 自动优化框架，通过 Worker 模型执行任务评测、Master 模型分析错误并生成多个候选 Prompt，在固定验证集上比较选优，实现自动化的 Prompt 迭代优化。
 
 ### 核心流程
 
-```
-标注数据 → Train/Val 抽样 → Worker 并发预测 → 收集错误 → Master 增量改写 → 评估新 Prompt → 保留/回滚
+```text
+标注数据
+  -> 固定 Train/Valid 抽样（单次抽样，整轮复用）
+  -> Worker Baseline 评测（Train + Valid）
+  -> 采样错误样本
+  -> Master 批量提炼 2-4 条系统级建议
+  -> 建议池召回 / 去重 / 灰区复核
+  -> Master 生成多个候选 Prompt
+  -> 候选 Valid 评测
+  -> 赢家补跑 Train
+  -> 保留 / 回滚
+  -> 全量数据最终评测
 ```
 
 ## 快速开始
@@ -36,7 +46,7 @@ python run_optimizer.py --config tasks/shenping/v1/config/test_v1.yaml
 | `--config` | **必填** YAML 配置文件路径 | `tasks/shenping/v1/config/test_v1.yaml` |
 | `--iterations` | 覆盖迭代轮数 | `--iterations 10` |
 | `--patience` | 覆盖 early stop 耐心值 | `--patience 3` |
-| `--metric` | 覆盖主评估指标 | `--metric accuracy` |
+| `--metric` | 覆盖主评估指标（`accuracy` / `f1` / `precision` / `precision_pos` / `recall`） | `--metric precision_pos` |
 | `--concurrency` | 覆盖 LLM 并发数 | `--concurrency 16` |
 | `--seed` | 覆盖随机种子 | `--seed 123` |
 | `--log-level` | 日志级别 | `--log-level DEBUG` |
@@ -74,13 +84,17 @@ prompt:
 optimizer:
   iterations: 5           # 优化轮数
   patience: 2             # early stop 耐心值
-  primary_metric: f1      # 主指标: accuracy | f1 | precision | recall
+  primary_metric: precision_pos  # 主指标: accuracy | f1 | precision | precision_pos | recall
   train_sample_size: 60   # 每轮 train 抽样数
   val_sample_size: 30     # 每轮 valid 抽样数
+  prompt_candidate_count: 3 # 每轮生成的候选 Prompt 数
   concurrency: 8          # LLM 并发数
   vote_count: 1           # 多数投票次数（1=不投票）
   max_retries: 3          # LLM 调用最大重试次数
   max_error_samples: 10   # 提供给 Master 的最大错误样本数
+  suggestion_similarity_threshold: 0.82
+  suggestion_concurrency: 4
+  suggestion_pool_dir: tasks/your_task/v1/artifacts/suggestions
   seed: 42                # 随机种子
 
 output:
@@ -100,7 +114,7 @@ master:                   # Master 模型配置（覆盖 .env 默认值）
   mode: ark
   temperature: 0.7
   top_p: 0.95
-  reasoning_option: disabled
+  reasoning_option: enabled  # 必须开启思考
 ```
 
 ## Python API
@@ -122,7 +136,8 @@ result = optimizer.optimize()
 #     "status": "completed",     # completed | perfect | error
 #     "best_score": 0.85,
 #     "best_metrics": {"accuracy": 0.9, "f1": 0.85, "precision": 0.88, "recall": 0.83},
-#     "steps": 5
+#     "steps": 5,
+#     "final_evaluation": { ... }
 # }
 ```
 
@@ -161,8 +176,8 @@ config = TaskConfig.from_yaml("tasks/shenping/v1/config/test_v1.yaml")
 
 # 访问配置
 print(config.task_name)        # "shenping"
-print(config.all_labels)       # ["不是", "不确定", "是"]
-print(config.primary_metric)   # "f1"
+print(config.all_labels)       # ["不是", "是"]
+print(config.primary_metric)   # "precision_pos"
 
 # 加载数据
 data = config.load_data()      # [{"fields": {...}, "label": "是"}, ...]
@@ -205,12 +220,15 @@ python run_optimizer.py --config tasks/your_task/v1/config/config.yaml
 
 | 文件 | 说明 |
 |------|------|
-| `results.json` | 每轮迭代的详细指标记录（JSON 数组） |
+| `results.json` | 每轮迭代的详细指标记录（含候选评分、选中候选、缓存统计） |
 | `best_prompt.md` | 最优 prompt 文本 |
 | `best_score.json` | 最优分数和对应指标 |
 | `optimization_log.md` | 可读的实验日志（含每轮 prompt 和错误分析） |
 | `prompt_comparison.md` | 原始 prompt 与最佳 prompt 的对比文件 |
+| `worker_prompt_log.md` | 每次 Worker system prompt 的评测记录 |
+| `master_log.md` | 每次调用 Master 的输入、候选输出、建议池去重决策 |
 | `final_evaluation.json` | 最终全量数据推理结果（原始/最佳 prompt 的指标对比 + 逐条预测详情） |
+| `final_evaluation.xlsx` | 全量数据逐条推理详情 |
 
 > **注意:** 优化过程不会覆盖原始 prompt 文件，最优 prompt 仅保存至 `output/best_prompt.md`。
 
@@ -225,12 +243,24 @@ prompt-optimizer/
 │   ├── task_config.py          # 任务配置加载与验证
 │   ├── evaluator.py            # LLM 评测与指标计算
 │   ├── optimizer.py            # 主优化循环
-│   └── master_prompt.py        # Master 模型 prompt 模板
+│   ├── master_prompt.py        # Master 模型 prompt 模板
+│   └── suggestion_pool.py      # 建议池：召回、去重、版本控制、快照
 ├── utils/
 │   ├── __init__.py
 │   └── llm_server.py           # LLM 客户端封装
 ├── tasks/
 │   └── shenping/v1/            # shenping 任务
 ├── tests/                      # 单元测试
+│   ├── test_optimizer.py
+│   └── test_run_optimizer.py
 └── docs/                       # 文档
 ```
+
+## 当前版本关键行为
+
+- 固定验证集：优化开始时一次性抽取 Train/Valid，整轮复用，避免每轮随机抽样带来的波动。
+- 两阶段评测：每轮候选先只跑 Valid，只有赢家补跑 Train，减少无效 Worker 调用。
+- 多候选搜索：Master 每轮默认生成多个候选 Prompt，在同一验证集上比较后选优。
+- 建议池增强：建议先按关键词/类别召回，再按相似度去重，灰区候选由 Master 复核。
+- Worker 推理缓存：同一轮中对相同 Prompt/样本的评测会复用缓存，减少重复请求。
+- Master 必须开思考：`master.reasoning_option` 若未开启，配置校验会直接报错。
