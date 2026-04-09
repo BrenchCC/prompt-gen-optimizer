@@ -1,8 +1,6 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
-import json
-import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import TYPE_CHECKING, Any
@@ -11,8 +9,8 @@ from loguru import logger
 from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 from tqdm import tqdm
 
-from utils.llm_server import LLM_Client
-import config as cfg
+from prompt_optimizer.llm_utils import build_llm_client, call_llm_with_retries, resolve_model_config
+from prompt_optimizer.response_utils import parse_json_dict, strip_code_fence
 
 if TYPE_CHECKING:
     from prompt_optimizer.task_config import TaskConfig
@@ -21,35 +19,70 @@ if TYPE_CHECKING:
 class Evaluator:
     def __init__(self, task_config: "TaskConfig") -> None:
         self.task_config = task_config
-        self.task_type: str = task_config.task_type
-        self.text_columns: list[str] = task_config.text_columns
-        self.label_map: dict[str, str] = task_config.label_map
-        self.label_descriptions: dict[str, str] = task_config.label_descriptions
-        self.prompt_variables: dict[str, str] = task_config.prompt_variables
-        self.concurrency: int = task_config.concurrency
-        self.vote_count: int = task_config.vote_count
-        self.max_retries: int = task_config.max_retries
-        self.output_field = task_config.output_field
-        self.output_map = task_config.output_map
         self.custom_parser_fn = task_config.load_custom_parser()
+        self.worker_options = resolve_model_config(role="worker", task_config=task_config)
         self.worker_client = self._init_worker_client()
 
-    def _init_worker_client(self) -> LLM_Client:
-        tc = self.task_config
-        api_key = cfg.WORKER_API_KEY
-        base_url = cfg.WORKER_BASE_URL
-        model_name = cfg.WORKER_MODEL_NAME
-        mode = getattr(tc, "worker_mode", "ark") or "ark"
-        return LLM_Client(
-            mode = mode,
-            api_key = api_key,
-            base_url = base_url,
-            default_model = model_name,
-            print_stream = False,
+    @property
+    def concurrency(self) -> int:
+        return self.task_config.concurrency
+
+    @property
+    def vote_count(self) -> int:
+        return self.task_config.vote_count
+
+    @property
+    def max_retries(self) -> int:
+        return self.task_config.max_retries
+
+    @property
+    def label_map(self) -> dict[str, str]:
+        return self.task_config.label_map
+
+    @property
+    def output_field(self) -> str:
+        return self.task_config.output_field
+
+    @property
+    def output_map(self) -> dict[str, str]:
+        return self.task_config.output_map
+
+    def _init_worker_client(self):
+        return build_llm_client(
+            mode=self.worker_options["mode"],
+            api_key=self.worker_options["api_key"],
+            base_url=self.worker_options["base_url"],
+            model_name=self.worker_options["model_name"],
         )
 
-    def _build_query(self, prompt: str, item: dict[str, Any]) -> str:
+    def _build_query(self, prompt: str | None, item: dict[str, Any]) -> str:
         return self.task_config.build_user_prompt(item["fields"])
+
+    @staticmethod
+    def _stringify_prediction_value(value: Any) -> str:
+        if value is None:
+            return "null"
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return str(value).strip()
+
+    def _map_prediction_value(self, value: Any) -> str:
+        str_val = self._stringify_prediction_value(value)
+        normalized = str_val.lower()
+
+        if self.output_map:
+            for src, dst in self.output_map.items():
+                if normalized == str(src).strip().lower():
+                    return dst
+
+        mapped = self.label_map.get(str_val)
+        if mapped:
+            return mapped
+
+        if str_val in self.label_map.values():
+            return str_val
+
+        return str_val
 
     def _parse_prediction(self, output: str) -> str:
         if not output:
@@ -58,55 +91,28 @@ class Evaluator:
         if self.custom_parser_fn:
             try:
                 result = self.custom_parser_fn(output)
-                return str(result) if result is not None else "PARSE_FAIL"
+                if result is None:
+                    return "PARSE_FAIL"
+                return self._map_prediction_value(result)
             except Exception as e:
                 logger.debug(f"自定义解析函数异常: {e}")
                 return "PARSE_FAIL"
 
-        text = output.strip()
-        if text.startswith("```"):
-            lines = text.split("\n")
-            text = "\n".join(lines[1:])
-            if text.endswith("```"):
-                text = text[:-3]
-            text = text.strip()
+        text = strip_code_fence(output)
+        obj = parse_json_dict(output)
 
         if self.output_field:
-            try:
-                obj = json.loads(text)
-                if isinstance(obj, dict) and self.output_field in obj:
-                    raw_val = obj[self.output_field]
-                    if raw_val is None:
-                        str_val = "null"
-                    elif isinstance(raw_val, bool):
-                        str_val = "true" if raw_val else "false"
-                    else:
-                        str_val = str(raw_val).strip().lower()
-                    if self.output_map:
-                        for src, dst in self.output_map.items():
-                            if str_val == str(src).lower():
-                                return dst
-                    mapped = self.label_map.get(str(raw_val), None)
-                    if mapped:
-                        return mapped
-                    if str(raw_val) in self.label_map.values():
-                        return str(raw_val)
-                    return str(raw_val)
-            except (json.JSONDecodeError, ValueError):
-                pass
+            if self.output_field in obj:
+                return self._map_prediction_value(obj[self.output_field])
 
-        try:
-            obj = json.loads(text)
-            if isinstance(obj, dict):
-                for k in ("label", "result", "prediction", "answer", "category", "output"):
-                    if k in obj:
-                        v = str(obj[k]).strip()
-                        if v in self.label_map:
-                            return self.label_map[v]
-                        if v in self.label_map.values():
-                            return v
-        except (json.JSONDecodeError, ValueError):
-            pass
+        for key in ("label", "result", "prediction", "answer", "category", "output"):
+            if key in obj:
+                return self._map_prediction_value(obj[key])
+
+        if self.output_map:
+            for src, dst in self.output_map.items():
+                if str(src) in text:
+                    return dst
 
         for lbl in sorted(self.label_map.values(), key=len, reverse=True):
             if lbl in text:
@@ -120,29 +126,30 @@ class Evaluator:
         system_prompt: str | None = None,
         temperature: float | None = None,
     ) -> str:
-        tc = self.task_config
-        temp = temperature if temperature is not None else getattr(tc, "worker_temperature", None) or cfg.WORKER_TEMPERATURE
-        top_p = getattr(tc, "worker_top_p", None) or cfg.WORKER_TOP_P
-        reasoning = getattr(tc, "worker_reasoning_option", cfg.WORKER_THINKING)
+        temp = temperature if temperature is not None else self.worker_options["temperature"]
+        top_p = self.worker_options["top_p"]
+        reasoning = self.worker_options["reasoning_option"]
 
-        for attempt in range(self.max_retries):
-            try:
-                _, result, _, _ = self.worker_client.chat(
-                    input_query=input_query,
-                    system_prompt=system_prompt,
-                    reasoning_option=reasoning,
-                    temperature=temp,
-                    top_p=top_p,
-                )
-                return result if isinstance(result, str) else ""
-            except Exception as e:
-                if attempt < self.max_retries - 1:
-                    wait = 2 ** attempt
-                    logger.warning(f"Worker LLM retry {attempt + 1}/{self.max_retries} after {wait}s: {e}")
-                    time.sleep(wait)
-                else:
-                    logger.error(f"Worker LLM API Error (all retries failed): {e}")
-                    return ""
+        def request() -> tuple[str, str]:
+            reasoning_content, result, _, _ = self.worker_client.chat(
+                input_query=input_query,
+                system_prompt=system_prompt,
+                reasoning_option=reasoning,
+                temperature=temp,
+                top_p=top_p,
+            )
+            return (
+                reasoning_content if isinstance(reasoning_content, str) else "",
+                result if isinstance(result, str) else "",
+            )
+
+        _, result = call_llm_with_retries(
+            client=self.worker_client,
+            label="Worker LLM",
+            max_retries=self.max_retries,
+            request_fn=request,
+        )
+        return result
 
     def _evaluate_single(
         self,
@@ -163,7 +170,7 @@ class Evaluator:
                 votes.append(self._parse_prediction(out))
             pred = Counter(votes).most_common(1)[0][0]
 
-        return idx, pred, item["label"], out, query, item["fields"].get(self.text_columns[0], "")[:30]
+        return idx, pred, item["label"], out, query, item["fields"].get(self.task_config.text_columns[0], "")[:30]
 
     def run_prompt(
         self,
@@ -213,12 +220,34 @@ class Evaluator:
         gt = [x["label"] for x in dataset]
         all_labels = sorted(set(self.label_map.values()))
 
+        precision_macro = precision_score(gt, preds, labels=all_labels, average="macro", zero_division=0)
         metrics: dict[str, float] = {
             "accuracy": accuracy_score(gt, preds),
             "f1": f1_score(gt, preds, labels=all_labels, average="macro", zero_division=0),
-            "precision": precision_score(gt, preds, labels=all_labels, average="macro", zero_division=0),
+            "precision": precision_macro,
+            "precision_macro": precision_macro,
             "recall": recall_score(gt, preds, labels=all_labels, average="macro", zero_division=0),
         }
+
+        pos_label = getattr(self.task_config, "positive_label", "") or ""
+        if not pos_label:
+            if "是" in all_labels:
+                pos_label = "是"
+            elif len(all_labels) == 2:
+                pos_label = all_labels[0]
+        if pos_label:
+            tp = 0
+            fp = 0
+            fn = 0
+            for p, g in zip(preds, gt):
+                if p == pos_label and g == pos_label:
+                    tp += 1
+                elif p == pos_label and g != pos_label:
+                    fp += 1
+                elif p != pos_label and g == pos_label:
+                    fn += 1
+            metrics["precision_pos"] = (tp / (tp + fp)) if (tp + fp) else 0.0
+            metrics["recall_pos"] = (tp / (tp + fn)) if (tp + fn) else 0.0
 
         errors: list[dict[str, Any]] = []
         for i, (p, g) in enumerate(zip(preds, gt)):

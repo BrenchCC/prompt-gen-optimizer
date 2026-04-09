@@ -10,7 +10,12 @@ sys.path.insert(0, ROOT)
 import pytest
 
 from prompt_optimizer.task_config import TaskConfig
-from prompt_optimizer.master_prompt import build_master_prompt, format_errors
+from prompt_optimizer.master_prompt import (
+    build_master_prompt,
+    build_master_system_prompt,
+    build_suggestion_prompt,
+    format_errors,
+)
 
 SHENPING_YAML = os.path.join(ROOT, "tasks", "shenping", "v1", "config", "test_v1.yaml")
 
@@ -92,16 +97,19 @@ class TestBuildMasterPrompt:
             current_prompt="test prompt",
             metrics_train={"f1": 0.8, "accuracy": 0.85},
             metrics_val={"f1": 0.75, "accuracy": 0.8},
-            errors_str="[错误样本 #1] Expected=是 Predicted=不是",
             total_errors=5,
             history=[],
             task_config=task_config,
+            round_suggestions="- [规则缺失] 补充边界条件",
+            experience_feedback="### 整体总结\n边界规则不足",
         )
-        assert "Prompt 工程师" in prompt
         assert "test prompt" in prompt
-        assert "增量改进" in prompt
-        assert "错误样本剖析" in prompt
-        assert "改进指南与约束" in prompt
+        assert "本轮错误经验与建议" in prompt
+        assert "错误经验反馈" in prompt
+        assert "建议摘要" in prompt
+        assert "错误经验反馈" in prompt
+        assert "Step 1：错误模式聚类" in prompt
+        assert "独立分析 5 条并提炼为优化建议" in prompt
 
     def test_includes_history(self, task_config: TaskConfig) -> None:
         history = [
@@ -112,7 +120,6 @@ class TestBuildMasterPrompt:
             current_prompt="test",
             metrics_train={"f1": 0.85},
             metrics_val={"f1": 0.8},
-            errors_str="none",
             total_errors=3,
             history=history,
             task_config=task_config,
@@ -125,10 +132,51 @@ class TestBuildMasterPrompt:
             current_prompt="test",
             metrics_train={"f1": 0.85},
             metrics_val={"f1": 0.8},
-            errors_str="none",
             total_errors=3,
             history=[],
             task_config=task_config,
         )
-        assert "[GT]" in prompt
-        assert "[Worker 输入]" in prompt
+        assert "[GT]" not in prompt
+        assert "[Worker 输入]" not in prompt
+        assert "本轮错误经验与建议" in prompt
+
+    def test_build_system_prompt_contains_long_term_suggestions(self, task_config: TaskConfig) -> None:
+        prompt = build_master_system_prompt(
+            task_config,
+            "- [SUG-0001] v2 | score=1 | 规则缺失 | 补充边界定义",
+        )
+        assert "长期系统级优化建议" in prompt
+        assert "补充边界定义" in prompt
+        assert "输出格式" in prompt
+
+    def test_build_suggestion_prompt_requires_json(self, task_config: TaskConfig) -> None:
+        errors = [
+            {
+                "fields": {"文章": "article", "评论": "comment"},
+                "expected": "是",
+                "predicted": "不是",
+                "worker_output": '{"is_shenping": false}',
+            },
+            {
+                "fields": {"文章": "article-2", "评论": "comment-2"},
+                "expected": "不是",
+                "predicted": "是",
+                "worker_output": '{"is_shenping": true}',
+            },
+        ]
+        prompt = build_suggestion_prompt(
+            errors=errors,
+            current_prompt="你是一个神评判断器",
+            task_config=task_config,
+            task_description="判断评论是否为神评",
+        )
+        assert "单个 JSON 对象" in prompt
+        assert "effective_strategies" in prompt
+        assert "ineffective_or_risky_strategies" in prompt
+        assert "suggestions" in prompt
+        assert "长度必须为 1" in prompt
+        assert '"title"' not in prompt
+        assert "<current_prompt>" in prompt
+        assert "你是一个神评判断器" in prompt
+        assert "[错误样本 #1]" in prompt
+        assert "[错误样本 #2]" in prompt

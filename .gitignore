@@ -435,5 +435,5 @@ CLAUDE.md
 .omc
 .codex*
 .claude*
-tasks/shenping/*/data
-tasks/shenping/*/output*
+tasks/*
+!tasks/.gitkeep

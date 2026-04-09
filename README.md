@@ -1,6 +1,6 @@
 # Prompt Optimizer
 
-基于 Agent 的 Prompt 自动优化框架。通过 Worker 模型执行任务评测、Master 模型分析错误并增量改写 Prompt，实现 Prompt 的自动化迭代优化。
+基于 Agent 的 Prompt 自动优化框架。当前版本采用“Worker 评测 → 单样本建议生成 → 建议池沉淀 → Master 双通道改写 Prompt”的多阶段优化架构，实现 Prompt 的自动化迭代优化。
 
 ## 核心流程
 
@@ -30,8 +30,14 @@
                              │
                              ▼
                   ┌────────────────────┐
-                  │  Master 分析错误    │  基于原始错误样本
-                  │  + 增量改写 Prompt  │  一步完成
+                  │  单样本建议生成      │  每个错误独立调用 Master
+                  │  + 建议池合并去重    │  形成系统级建议
+                  └─────────┬──────────┘
+                            │
+                            ▼
+                  ┌────────────────────┐
+                  │  Master 增量改写     │  system/user 双通道
+                  │  注入合并建议 + 当前错误│
                   └─────────┬──────────┘
                             │
                             ▼
@@ -59,6 +65,7 @@
 ### 关键设计
 
 - **错误驱动优化** — Master 模型基于 Worker 的真实错误样本分析共性问题，而非凭空改写
+- **建议池沉淀** — 单样本建议会沉淀到任务级建议池，支持去重、版本化与历史快照
 - **增量改写** — 每轮只针对错误模式做局部调整，避免破坏已有能力
 - **自动回滚** — 验证集指标未提升则回滚到历史最优 Prompt
 - **Early Stop** — 连续 N 轮无提升自动终止，避免无效计算
@@ -78,7 +85,8 @@ prompt-optimizer/
 │   ├── task_config.py              # YAML 任务配置加载与验证
 │   ├── evaluator.py                # LLM 评测：并发推理、结果解析、指标计算
 │   ├── optimizer.py                # 主优化循环：baseline → 迭代改写 → early stop → 全量评测
-│   └── master_prompt.py            # Master 模型 Prompt 模板构建
+│   ├── master_prompt.py            # Master 模型 Prompt 模板构建
+│   └── suggestion_pool.py          # 建议池：去重、版本控制、索引、快照
 │
 ├── utils/
 │   ├── __init__.py
@@ -220,6 +228,9 @@ optimizer:
   vote_count: 1                         # 多数投票次数（1=不投票）
   max_retries: 3                        # LLM 调用最大重试次数
   max_error_samples: 10                 # 提供给 Master 的最大错误样本数
+  suggestion_similarity_threshold: 0.82 # 建议池语义去重阈值
+  suggestion_concurrency: 4             # 单样本建议分析并发数
+  suggestion_pool_dir: tasks/shenping/v1/artifacts/suggestions
   seed: 42                              # 随机种子
 
 output:
@@ -257,9 +268,17 @@ master:                                 # Master 模型参数（覆盖 .env）
 | `best_score.json` | 最优分数及对应指标 |
 | `optimization_log.md` | 可读的实验日志（每轮 Prompt + 指标 + 错误分析） |
 | `prompt_comparison.md` | 原始 Prompt 与最佳 Prompt 的对比文件 |
-| `master_log.md` | 每次调用 Master 模型的完整输入 (Input Query) 与原始输出 (Raw Output) |
+| `master_log.md` | 每次调用 Master 模型的 system/user 输入、单样本建议调用、去重决策与原始输出 |
 | `final_evaluation.json` | 全量数据最终评测的汇总指标（原始 vs 最佳） |
 | `final_evaluation.xlsx` | 全量数据逐条推理详情（含 JSON 字段拆分） |
+
+任务级建议池会额外保存在 `tasks/{task}/{version}/artifacts/suggestions/` 下：
+
+| 文件 | 说明 |
+|------|------|
+| `suggestion_pool.json` | 当前活跃建议池与建议级历史 |
+| `suggestion_index.json` | 关键词索引与文本指纹索引 |
+| `suggestion_snapshots.json` | 每轮优化后的池级快照 |
 
 ### final_evaluation.xlsx 列说明
 
@@ -383,6 +402,36 @@ python -m pytest tests/ -v
 | 角色 | 用途 | 建议配置 |
 |------|------|----------|
 | **Worker** | 执行任务推理（分类/评测） | 快速低成本模型，低温度，关闭思考模式 |
-| **Master** | 分析错误样本 + 增量改写 Prompt | 强推理模型，较高温度，可开启思考模式 |
+| **Master** | 单样本错误分析、建议去重复核、最终 Prompt 增量改写 | 强推理模型，较高温度，可开启思考模式 |
 
 两组模型通过 `.env` 文件配置 API 密钥和端点，YAML 中可覆盖 `temperature`、`top_p`、`reasoning_option` 等推理参数。LLM 调用通过 `utils/llm_server.py` 封装，支持 Ark（火山引擎）和 OpenAI 两种后端。
+
+## 优化架构
+
+### 分层设计
+
+| 层级 | 核心职责 | 关键产物 |
+|------|----------|----------|
+| **评测层** | Worker 对 train/valid 抽样数据做并发推理，返回预测、原始输出、用户输入 | 指标、错误样本 |
+| **建议生成层** | 针对每个错误样本独立调用 Master，生成结构化 suggestion | 单样本建议 |
+| **建议池层** | 对 suggestion 做去重、合并、版本控制、快照、索引维护 | `suggestion_pool.json` / `suggestion_index.json` / `suggestion_snapshots.json` |
+| **Prompt 改写层** | 将长期 merged suggestions 注入 Master system_prompt，把本轮错误样本和新增建议注入 user prompt | 新的 Worker system prompt |
+| **反馈闭环层** | 根据本轮 valid 指标变化回写建议有效性，更新 `positive_hits / negative_hits / effectiveness_score` | 建议效果历史 |
+
+### 调用链路
+
+1. Worker 在当前 prompt 下完成 train/valid 推理，并收集错误样本。
+2. 从错误样本中按 `max_error_samples` 采样，每个样本独立调用一次 Master，生成结构化 suggestion。
+3. 新 suggestion 写入任务级建议池，先做关键词/文本相似度召回，再对灰区候选做 LLM 复核。
+4. 建议池输出去重后的系统级建议摘要，作为 Master 的长期 system_prompt。
+5. 当前轮错误样本、实验历史、当前 prompt、本轮新增建议摘要作为 Master 的 user prompt。
+6. Master 只输出增量优化后的完整 prompt；若 valid 指标未提升，则回滚到历史最佳 prompt。
+7. 本轮被采纳的建议根据指标变化写回效果分数，并生成池级快照。
+
+### 关键约束
+
+- **错误样本独立调用**：每个错误样本必须单独分析，避免多样本互相污染。
+- **系统级建议沉淀**：原始错误样本不直接进入长期 system_prompt，进入的是合并后的系统级建议。
+- **可追溯性**：建议池保留 `source_samples`、`source_suggestions`、`merged_from`、版本号和快照。
+- **配置化去重**：语义去重阈值通过 `suggestion_similarity_threshold` 控制。
+- **异步并发**：单样本建议分析使用线程池并发执行，避免串行阻塞。

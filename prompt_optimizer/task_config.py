@@ -24,6 +24,7 @@ class TaskConfig:
     label_column: str = ""
     label_map: Dict[str, str] = field(default_factory=dict)
     label_descriptions: Dict[str, str] = field(default_factory=dict)
+    positive_label: str = ""
     output_field: str = ""
     output_map: Dict[str, str] = field(default_factory=dict)
     custom_parser: str = ""
@@ -42,6 +43,9 @@ class TaskConfig:
     vote_count: int = 1
     max_retries: int = 3
     max_error_samples: int = 10
+    suggestion_similarity_threshold: float = 0.82
+    suggestion_concurrency: int = 4
+    suggestion_pool_dir: str = ""
     seed: int = default_cfg.DEFAULT_SEED
 
     output_dir: str = ""
@@ -54,6 +58,7 @@ class TaskConfig:
     worker_api_key: str = ""
     worker_base_url: str = ""
     worker_model_name: str = ""
+    worker_model_identifier: str = ""
     worker_temperature: Optional[float] = None
     worker_top_p: Optional[float] = None
     worker_reasoning_option: str = "disabled"
@@ -62,6 +67,7 @@ class TaskConfig:
     master_api_key: str = ""
     master_base_url: str = ""
     master_model_name: str = ""
+    master_model_identifier: str = ""
     master_temperature: Optional[float] = None
     master_top_p: Optional[float] = None
     master_reasoning_option: str = "disabled"
@@ -94,6 +100,7 @@ class TaskConfig:
         cfg.label_column = data_sec.get("label_column", cfg.label_column)
         cfg.label_map = data_sec.get("label_map", cfg.label_map)
         cfg.label_descriptions = data_sec.get("label_descriptions", cfg.label_descriptions)
+        cfg.positive_label = str(data_sec.get("positive_label", cfg.positive_label) or "").strip()
         cfg.output_field = data_sec.get("output_field", cfg.output_field)
         cfg.output_map = data_sec.get("output_map", cfg.output_map)
         cfg.custom_parser = data_sec.get("custom_parser", cfg.custom_parser)
@@ -114,6 +121,15 @@ class TaskConfig:
         cfg.vote_count = opt_sec.get("vote_count", cfg.vote_count)
         cfg.max_retries = opt_sec.get("max_retries", cfg.max_retries)
         cfg.max_error_samples = opt_sec.get("max_error_samples", cfg.max_error_samples)
+        cfg.suggestion_similarity_threshold = opt_sec.get(
+            "suggestion_similarity_threshold",
+            cfg.suggestion_similarity_threshold,
+        )
+        cfg.suggestion_concurrency = opt_sec.get(
+            "suggestion_concurrency",
+            cfg.suggestion_concurrency,
+        )
+        cfg.suggestion_pool_dir = cls._resolve(project_root, opt_sec.get("suggestion_pool_dir", ""))
         cfg.seed = opt_sec.get("seed", cfg.seed)
 
         out_sec = raw.get("output", {})
@@ -125,18 +141,36 @@ class TaskConfig:
 
         worker_sec = raw.get("worker", {})
         cfg.worker_mode = worker_sec.get("mode", cfg.worker_mode)
-        cfg.worker_api_key = worker_sec.get("api_key", default_cfg.WORKER_API_KEY)
-        cfg.worker_base_url = worker_sec.get("base_url", default_cfg.WORKER_BASE_URL)
-        cfg.worker_model_name = worker_sec.get("model_name", default_cfg.WORKER_MODEL_NAME)
+        cfg.worker_api_key = worker_sec.get("api_key", "") or default_cfg.WORKER_API_KEY
+        cfg.worker_base_url = worker_sec.get("base_url", "") or default_cfg.WORKER_BASE_URL
+        cfg.worker_model_name = (
+            worker_sec.get("name")
+            or worker_sec.get("model_name")
+            or default_cfg.WORKER_MODEL_NAME
+        )
+        cfg.worker_model_identifier = (
+            worker_sec.get("identifier")
+            or worker_sec.get("model_identifier")
+            or default_cfg.WORKER_MODEL_IDENTIFIER
+        )
         cfg.worker_temperature = worker_sec.get("temperature", default_cfg.WORKER_TEMPERATURE)
         cfg.worker_top_p = worker_sec.get("top_p", default_cfg.WORKER_TOP_P)
         cfg.worker_reasoning_option = worker_sec.get("reasoning_option", default_cfg.WORKER_THINKING)
 
         master_sec = raw.get("master", {})
         cfg.master_mode = master_sec.get("mode", cfg.master_mode)
-        cfg.master_api_key = master_sec.get("api_key", default_cfg.MASTER_API_KEY)
-        cfg.master_base_url = master_sec.get("base_url", default_cfg.MASTER_BASE_URL)
-        cfg.master_model_name = master_sec.get("model_name", default_cfg.MASTER_MODEL_NAME)
+        cfg.master_api_key = master_sec.get("api_key", "") or default_cfg.MASTER_API_KEY
+        cfg.master_base_url = master_sec.get("base_url", "") or default_cfg.MASTER_BASE_URL
+        cfg.master_model_name = (
+            master_sec.get("name")
+            or master_sec.get("model_name")
+            or default_cfg.MASTER_MODEL_NAME
+        )
+        cfg.master_model_identifier = (
+            master_sec.get("identifier")
+            or master_sec.get("model_identifier")
+            or default_cfg.MASTER_MODEL_IDENTIFIER
+        )
         cfg.master_temperature = master_sec.get("temperature", default_cfg.MASTER_TEMPERATURE)
         cfg.master_top_p = master_sec.get("top_p", default_cfg.MASTER_TOP_P)
         cfg.master_reasoning_option = master_sec.get("reasoning_option", default_cfg.MASTER_THINKING)
@@ -157,6 +191,9 @@ class TaskConfig:
         if self.task_type not in ("classify", "judge"):
             raise ValueError(f"不支持的任务类型: {self.task_type}")
 
+        if self.primary_metric not in ("accuracy", "f1", "precision", "precision_pos", "recall"):
+            raise ValueError("primary_metric 必须是 accuracy/f1/precision/precision_pos/recall 之一")
+
         if self.data_format not in ("csv", "xlsx"):
             raise ValueError(f"不支持的数据格式: {self.data_format}")
 
@@ -171,6 +208,37 @@ class TaskConfig:
 
         if not self.label_map:
             raise ValueError("未指定 label_map")
+
+        if self.positive_label and self.positive_label not in set(self.label_map.values()):
+            raise ValueError("positive_label 必须是 label_map 的值之一")
+
+        if self.primary_metric == "precision_pos":
+            labels = set(self.label_map.values())
+            if not self.positive_label and "是" not in labels and len(labels) != 2:
+                raise ValueError("primary_metric=precision_pos 时需配置 data.positive_label（或标签中包含“是”，或为二分类）")
+
+        if not 1 <= self.max_error_samples <= 20:
+            raise ValueError("max_error_samples 必须在 1 到 20 之间")
+
+        if not 0 < self.suggestion_similarity_threshold < 1:
+            raise ValueError("suggestion_similarity_threshold 必须在 0 到 1 之间")
+
+        if self.suggestion_concurrency < 1:
+            raise ValueError("suggestion_concurrency 必须大于等于 1")
+
+        if not self.suggestion_pool_dir:
+            raise ValueError("未指定 suggestion_pool_dir")
+
+    def ensure_output_dir(self) -> str:
+        if self.output_dir:
+            os.makedirs(self.output_dir, exist_ok=True)
+        return self.output_dir
+
+    def ensure_prompt_dir(self) -> str:
+        prompt_dir = os.path.dirname(self.prompt_file)
+        if prompt_dir:
+            os.makedirs(prompt_dir, exist_ok=True)
+        return prompt_dir
 
     @property
     def output_results_path(self) -> str:
@@ -201,12 +269,32 @@ class TaskConfig:
         return os.path.join(self.output_dir, "final_evaluation.json")
 
     @property
+    def output_config_path(self) -> str:
+        return os.path.join(self.output_dir, "config.json")
+
+    @property
     def output_master_log_path(self) -> str:
         return os.path.join(self.output_dir, "master_log.md")
 
     @property
     def output_worker_prompt_log_path(self) -> str:
         return os.path.join(self.output_dir, "worker_prompt_log.md")
+
+    @property
+    def suggestion_store_dir(self) -> str:
+        return self.suggestion_pool_dir
+
+    @property
+    def suggestion_pool_path(self) -> str:
+        return os.path.join(self.suggestion_store_dir, "suggestion_pool.json")
+
+    @property
+    def suggestion_snapshots_path(self) -> str:
+        return os.path.join(self.suggestion_store_dir, "suggestion_snapshots.json")
+
+    @property
+    def suggestion_index_path(self) -> str:
+        return os.path.join(self.suggestion_store_dir, "suggestion_index.json")
 
     @property
     def all_labels(self) -> List[str]:
@@ -308,9 +396,7 @@ class TaskConfig:
         return content
 
     def write_prompt(self, content: str) -> None:
-        prompt_dir = os.path.dirname(self.prompt_file)
-        if prompt_dir:
-            os.makedirs(prompt_dir, exist_ok=True)
+        self.ensure_prompt_dir()
         with open(self.prompt_file, "w", encoding="utf-8") as f:
             f.write(content)
         logger.info(f"Prompt 已写入: {self.prompt_file} ({len(content)} 字符)")

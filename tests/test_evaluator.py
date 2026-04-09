@@ -22,20 +22,20 @@ def evaluator() -> Evaluator:
 
 
 class TestParsePrediction:
-    def test_output_field_true(self, evaluator: Evaluator) -> None:
-        output = '{"reasoning": "test", "is_shenping": true, "category": "抖机灵调侃型"}'
+    def test_output_field_positive_category(self, evaluator: Evaluator) -> None:
+        output = '{"reasoning": "test", "is_shenping": true}'
         assert evaluator._parse_prediction(output) == "是"
 
-    def test_output_field_false(self, evaluator: Evaluator) -> None:
-        output = '{"reasoning": "test", "is_shenping": false, "category": null}'
+    def test_output_field_negative_category(self, evaluator: Evaluator) -> None:
+        output = '{"reasoning": "test", "is_shenping": false}'
         assert evaluator._parse_prediction(output) == "不是"
 
-    def test_output_field_null(self, evaluator: Evaluator) -> None:
-        output = '{"reasoning": "test", "is_shenping": null, "category": null}'
-        assert evaluator._parse_prediction(output) == "不确定"
+    def test_output_field_with_whitespace(self, evaluator: Evaluator) -> None:
+        output = '{"reasoning": "test", "is_shenping": " false "}'
+        assert evaluator._parse_prediction(output) == "不是"
 
     def test_json_in_code_block(self, evaluator: Evaluator) -> None:
-        output = '```json\n{"reasoning": "test", "is_shenping": true, "category": "精准评价型"}\n```'
+        output = '```json\n{"reasoning": "test", "is_shenping": true}\n```'
         assert evaluator._parse_prediction(output) == "是"
 
     def test_empty_output(self, evaluator: Evaluator) -> None:
@@ -45,7 +45,10 @@ class TestParsePrediction:
     def test_plain_label_fallback(self, evaluator: Evaluator) -> None:
         assert evaluator._parse_prediction("是") == "是"
         assert evaluator._parse_prediction("不是") == "不是"
-        assert evaluator._parse_prediction("不确定") == "不确定"
+
+    def test_plain_category_fallback(self, evaluator: Evaluator) -> None:
+        assert evaluator._parse_prediction("非神评") == "PARSE_FAIL"
+        assert evaluator._parse_prediction("这条评论属于精准评价型") == "PARSE_FAIL"
 
     def test_custom_parser(self) -> None:
         cfg = TaskConfig.from_yaml(SHENPING_YAML, project_root=ROOT)
@@ -58,10 +61,10 @@ class TestParsePrediction:
     def test_generic_json_fallback(self) -> None:
         cfg = TaskConfig.from_yaml(SHENPING_YAML, project_root=ROOT)
         cfg.output_field = ""
-        cfg.output_map = {}
         e = Evaluator(cfg)
         assert e._parse_prediction('{"label": "是"}') == "是"
         assert e._parse_prediction('{"result": "不是"}') == "不是"
+        assert e._parse_prediction('{"is_shenping": true}') == "是"
 
 
 class TestBuildQuery:
@@ -86,6 +89,9 @@ class TestEvaluate:
         preds = ["是", "不是"]
         metrics, errors = evaluator.evaluate(preds, dataset)
         assert metrics["accuracy"] == 1.0
+        assert metrics["precision"] == 1.0
+        assert metrics["precision_macro"] == 1.0
+        assert metrics["precision_pos"] == 1.0
         assert len(errors) == 0
 
     def test_all_wrong(self, evaluator: Evaluator) -> None:
@@ -96,6 +102,7 @@ class TestEvaluate:
         preds = ["不是", "是"]
         metrics, errors = evaluator.evaluate(preds, dataset)
         assert metrics["accuracy"] == 0.0
+        assert metrics["precision_pos"] == 0.0
         assert len(errors) == 2
 
     def test_empty_dataset(self, evaluator: Evaluator) -> None:
